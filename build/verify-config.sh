@@ -34,6 +34,7 @@ echo "tree defines $(wc -l < "$SYMS") kconfig symbols"
 has_symbol() { grep -cx "$1" "$SYMS" >/dev/null; }
 
 fail=0
+MISSING=""
 for s in $REQUIRED; do
   if ! has_symbol "$s"; then
     echo "NO SUCH SYMBOL in this tree: CONFIG_$s  (特性本身不存在，跳过)"
@@ -41,9 +42,23 @@ for s in $REQUIRED; do
   fi
   if ! grep -qE "^CONFIG_$s=[ym]$" "$CFG"; then
     echo "MISSING REQUIRED: CONFIG_$s"
+    MISSING="$MISSING $s"
     fail=1
   fi
 done
+
+# 缺失多半是依赖没满足。打印该符号在 Kconfig 里的原始定义块（含 depends on / select），
+# 只在失败路径上跑，最多 12 个，避免全树 grep 拖慢 CI。
+if [ "$fail" = 1 ]; then
+  echo "--- 缺失符号的 Kconfig 定义（看 depends on 缺什么）---"
+  n=0
+  for s in $MISSING; do
+    [ "$n" -ge 12 ] && { echo "  (其余 $(( $(echo $MISSING | wc -w) - n )) 个省略)"; break; }
+    grep -rn -A8 --include=Kconfig --include='Kconfig*' -E "^config $s\$" "$TREE" 2>/dev/null \
+      | grep -vE '^\s*$' | sed -e "s|^$TREE/||" -e 's|^|    |' | head -12
+    n=$((n+1))
+  done
+fi
 
 if grep -qE "^CONFIG_ANDROID_PARANOID_NETWORK=y$" "$CFG"; then
   echo "STILL ON: CONFIG_ANDROID_PARANOID_NETWORK (容器内无法建 socket)"
