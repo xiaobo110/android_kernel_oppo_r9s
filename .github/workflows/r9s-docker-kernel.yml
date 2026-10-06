@@ -74,20 +74,35 @@ jobs:
           # 内核 scripts/gcc-version.sh 是按命令名直接调 $(CROSS_COMPILE)gcc 的，
           # 只给绝对路径没用，必须把工具链 bin 追加进后续步骤的 PATH
           echo "$BINDIR" >> "$GITHUB_PATH"
-          # 新版 libmpfr/libgmp 的名字兜底
-          for lib in libmpfr.so.4 libgmp.so.10; do
-            have=$(ldd "$GCC" 2>/dev/null | grep -c "$lib.*not found" || true)
-            if [ "$have" != "0" ]; then
+          # kernel.org 的 4.9 是在老发行版上构建的，cc1 链的是 libmpfr.so.4 / libgmp.so.3，
+          # jammy 只有 .so.6 / .so.10。注意要 ldd 的是 cc1 本体，不是 gcc driver（driver 不链这些）。
+          mkdir -p /home/runner/tc/compat
+          CC1=$(find "$(dirname "$(dirname "$GCC")")" -name cc1 -type f 2>/dev/null | head -1)
+          echo "cc1: $CC1"
+          PROBE="$GCC $CC1"
+          for lib in libmpfr.so.4 libgmp.so.3 libgmp.so.10 libmpfr.so.6; do
+            if ldd $PROBE 2>/dev/null | grep -q "$lib.*not found"; then
               case "$lib" in
-                libmpfr*) real=/usr/lib/x86_64-linux-gnu/libmpfr.so.6 ;;
-                libgmp*)  real=/usr/lib/x86_64-linux-gnu/libgmp.so.10 ;;
+                libmpfr.so.4) real=/usr/lib/x86_64-linux-gnu/libmpfr.so.6 ;;
+                libgmp.so.3)  real=/usr/lib/x86_64-linux-gnu/libgmp.so.10 ;;
+                *)            real=/usr/lib/x86_64-linux-gnu/$lib ;;
               esac
-              mkdir -p /home/runner/tc/compat
-              ln -sf "$real" "/home/runner/tc/compat/$lib"
-              echo "LD_LIBRARY_PATH=/home/runner/tc/compat" >> "$GITHUB_ENV"
-              echo "linked $lib -> $real"
+              if [ -f "$real" ]; then
+                ln -sf "$real" "/home/runner/tc/compat/$lib"
+                echo "linked $lib -> $real"
+              else
+                echo "!! 系统里也没有 $real，无法兜底"
+              fi
             fi
           done
+          echo "LD_LIBRARY_PATH=/home/runner/tc/compat" >> "$GITHUB_ENV"
+          # GITHUB_ENV 只对后续步骤生效，本步骤内要自己 export 才能立刻验证
+          export LD_LIBRARY_PATH=/home/runner/tc/compat:${LD_LIBRARY_PATH:-}
+          echo "--- 兜底后 cc1 的缺失库（应为空）---"
+          ldd "$CC1" 2>/dev/null | grep "not found" || echo "  (全部可满足)"
+          # 只编译不链接：nolibc 工具链本来就没有 C 库，链接测试必然失败，没意义
+          echo 'int main(void){return 0;}' > /tmp/t.c
+          "$GCC" -c /tmp/t.c -o /tmp/t.o && echo "工具链自检通过（cc1 可用）"
 
       - name: 应用容器补丁
         run: |
