@@ -28,7 +28,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libelf-dev libssl-dev \
-            device-tree-compiler xz-utils lz4 cpio rsync python3 libmpfr6 libgmp10
+            device-tree-compiler xz-utils lz4 cpio rsync python3 python2 libmpfr6 libgmp10
+          # 这棵树里有 #!/usr/bin/env python2 的脚本（上一轮就是被它顶死在 Error 127），列出来备查
+          echo "== 需要 python2 的脚本 =="
+          grep -rl 'usr/bin/env python2' --include='*.py' --include='*.pl' . 2>/dev/null | head -10
+          python2 -V 2>&1 | head -1
 
       - name: 获取 aarch64 gcc 4.9 交叉工具链
         # 内核 banner 显示 crDroid 用的就是 gcc 4.9，用同代编译器最稳（3.18 在 gcc10+ 上会因
@@ -45,11 +49,13 @@ jobs:
             if ! curl -fL --retry 3 --max-time 900 -o tc.dl "$u"; then echo "  下载失败"; continue; fi
             # 只看 http 码不够：要确认拿回来的确实是归档并能解开、gcc 真能跑
             if ! tar -xf tc.dl -C tcdir 2>/dev/null; then echo "  不是有效归档（大小 $(stat -c%s tc.dl)）"; continue; fi
-            GCC=$(find /home/runner/tc/tcdir -maxdepth 3 -name '*-gcc' -type f | head -1)
-            [ -n "$GCC" ] || { echo "  归档里没有 gcc driver"; continue; }
+            # 真实布局是 tcdir/x86_64-gcc-4.9.4-nolibc/aarch64-linux/bin/aarch64-linux-gcc，
+            # 驱动文件在第 4 层，之前 maxdepth 3 + -type f 会漏掉（可能是符号链接），所以放宽再逐个试跑
+            GCC=$(find /home/runner/tc/tcdir -path '*/bin/*gcc' 2>/dev/null | head -1)
+            [ -n "$GCC" ] || { echo "  归档里没有 gcc driver：$(ls -R /home/runner/tc/tcdir | head -20)"; continue; }
             if "$GCC" --version 2>&1 | head -1; then echo "  可用：$u"; cp tc.dl tc.ok; break; else echo "  gcc 跑不起来"; fi
           done
-          GCC=$(find /home/runner/tc/tcdir -maxdepth 3 -name '*-gcc' -type f | head -1)
+          GCC=$(find /home/runner/tc/tcdir -path '*/bin/*gcc' 2>/dev/null | head -1)
           if [ ! -f tc.ok ] || [ -z "$GCC" ]; then
             echo "kernel.org 全部失败，退回 apt 的 aarch64 交叉 gcc（版本新，需要 -fcommon 兜住 3.18）"
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
@@ -58,6 +64,10 @@ jobs:
           fi
           echo "gcc driver: $GCC"
           "$GCC" --version | head -1
+          # HOSTCC 用的是 runner 自带的 gcc-11，它默认 -fno-common，会让 3.18 的
+          # scripts/dtc（yylloc 重复定义）链接失败；交叉 gcc 换老版本也治不了 host 工具，
+          # 所以统一给 host 编译加 -fcommon。
+          echo "HOST_EXTRACFLAGS=-fcommon" >> "$GITHUB_ENV"
           BINDIR=$(dirname "$GCC")
           echo "CROSS_COMPILE=$(basename "$GCC" | sed 's/-gcc$//')-" >> "$GITHUB_ENV"
           echo "TC_BINDIR=$BINDIR" >> "$GITHUB_ENV"
