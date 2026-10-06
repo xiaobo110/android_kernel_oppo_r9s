@@ -32,26 +32,32 @@ jobs:
 
       - name: 获取 aarch64 gcc 4.9 交叉工具链
         # 内核 banner 显示 crDroid 用的就是 gcc 4.9，用同代编译器最稳（3.18 在 gcc10+ 上会因
-        # -fno-common 等一堆问题编不过）
+        # -fno-common 等一堆问题编不过）。
+        # 注意 kernel.org 的真实文件名带 x86_64- 前缀；releases.linaro.org 已整站跳转、不可用。
         run: |
           set -e
           mkdir -p /home/runner/tc && cd /home/runner/tc
-          URLS="
-          https://www.kernel.org/pub/tools/crosstool/files/bin/x86_64/4.9.4/gcc-4.9.4-nolibc-aarch64-linux.tar.xz
-          https://cdn.kernel.org/pub/tools/crosstool/files/bin/x86_64/4.9.4/gcc-4.9.4-nolibc-aarch64-linux.tar.xz
-          https://releases.linaro.org/components/toolchain/binaries/4.9-2016.06/aarch64-linux-gnu/gcc-linaro-4.9-2016.06-x86_64_aarch64-linux-gnu.tar.xz
-          https://releases.linaro.org/components/toolchain/binaries/4.9-2015.06/aarch64-linux-gnu/gcc-linaro-4.9-2015.06-x86_64_aarch64-linux-gnu.tar.xz
-          "
-          ok=0
+          KP=/pub/tools/crosstool/files/bin/x86_64/4.9.4/x86_64-gcc-4.9.4-nolibc-aarch64-linux
+          URLS="https://cdn.kernel.org${KP}.tar.xz https://www.kernel.org${KP}.tar.xz https://www.kernel.org${KP}.tar.gz"
           for u in $URLS; do
-            echo "trying $u"
-            if curl -fL --retry 2 --max-time 900 -o tc.tar.xz "$u"; then ok=1; echo "GOT $u"; break; fi
+            echo "--- trying $u"
+            rm -rf tc.* tcdir; mkdir -p tcdir
+            if ! curl -fL --retry 3 --max-time 900 -o tc.dl "$u"; then echo "  下载失败"; continue; fi
+            # 只看 http 码不够：要确认拿回来的确实是归档并能解开、gcc 真能跑
+            if ! tar -xf tc.dl -C tcdir 2>/dev/null; then echo "  不是有效归档（大小 $(stat -c%s tc.dl)）"; continue; fi
+            GCC=$(find /home/runner/tc/tcdir -maxdepth 3 -name '*-gcc' -type f | head -1)
+            [ -n "$GCC" ] || { echo "  归档里没有 gcc driver"; continue; }
+            if "$GCC" --version 2>&1 | head -1; then echo "  可用：$u"; cp tc.dl tc.ok; break; else echo "  gcc 跑不起来"; fi
           done
-          [ "$ok" = 1 ] || { echo "no toolchain source worked"; exit 1; }
-          tar -xf tc.tar.xz
-          rm -f tc.tar.xz
-          GCC=$(find /home/runner/tc -maxdepth 3 -name '*-gcc' -type f | head -1)
+          GCC=$(find /home/runner/tc/tcdir -maxdepth 3 -name '*-gcc' -type f | head -1)
+          if [ ! -f tc.ok ] || [ -z "$GCC" ]; then
+            echo "kernel.org 全部失败，退回 apt 的 aarch64 交叉 gcc（版本新，需要 -fcommon 兜住 3.18）"
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            GCC=$(command -v aarch64-linux-gnu-gcc)
+            echo "EXTRA_KCFLAGS=-fcommon" >> "$GITHUB_ENV"
+          fi
           echo "gcc driver: $GCC"
+          "$GCC" --version | head -1
           BINDIR=$(dirname "$GCC")
           echo "CROSS_COMPILE=$(basename "$GCC" | sed 's/-gcc$//')-" >> "$GITHUB_ENV"
           echo "TC_BINDIR=$BINDIR" >> "$GITHUB_ENV"
@@ -65,12 +71,10 @@ jobs:
               esac
               mkdir -p /home/runner/tc/compat
               ln -sf "$real" "/home/runner/tc/compat/$lib"
-              export LD_LIBRARY_PATH=/home/runner/tc/compat:${LD_LIBRARY_PATH:-}
               echo "LD_LIBRARY_PATH=/home/runner/tc/compat" >> "$GITHUB_ENV"
               echo "linked $lib -> $real"
             fi
           done
-          "$GCC" --version | head -1
 
       - name: 应用容器补丁
         run: |
@@ -95,11 +99,11 @@ jobs:
         # 本地重打包默认用 base boot.img 里原有的 4 个 DTB，这里只是顺带产出可比对的副本。
         run: |
           set -eo pipefail
-          M="make ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE O=out KCFLAGS=-w"
-          $M -j"$(nproc)" dtbs modules > build.log 2>&1 \
+          mk() { make ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" O=out KCFLAGS="-w ${EXTRA_KCFLAGS:-}" "$@"; }
+          mk -j"$(nproc)" dtbs modules > build.log 2>&1 \
             || { echo "=== BUILD FAILED ==="; tail -100 build.log; exit 1; }
-          $M Image.gz >> build.log 2>&1 || { tail -60 build.log; exit 1; }
-          $M Image.gz-dtb >> build.log 2>&1 || echo "Image.gz-dtb target unavailable (will append DTBs locally)"
+          mk Image.gz >> build.log 2>&1 || { tail -60 build.log; exit 1; }
+          mk Image.gz-dtb >> build.log 2>&1 || echo "Image.gz-dtb target unavailable (will append DTBs locally)"
           tail -20 build.log
           ls -l out/arch/arm64/boot/
           echo "dtb count: $(find out/arch/arm64/boot/dts -name '*.dtb' | wc -l)"
