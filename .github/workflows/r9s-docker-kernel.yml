@@ -86,11 +86,18 @@ jobs:
           git status --short | head
 
       - name: 配置
+        # 不用 merge_config.sh：它在 O=out 时会把合并结果写到源码根的 ./.config，
+        # 于是 make O=out 又去读未合并的 out/.config —— 上一轮片段就是这么全军覆没的。
+        # 改为把片段直接追加到 r9s_defconfig 末尾：kconfig 顺序读取，同名符号后者胜出，
+        # 这也和 hengwu0 原补丁的做法一致。
         run: |
           set -e
+          grep -E '^(CONFIG_[A-Z0-9_]+=.+|# CONFIG_[A-Z0-9_]+ is not set)$' \
+            build/r9s-docker.fragment >> arch/arm64/configs/r9s_defconfig
+          echo "追加进 defconfig 的行数: $(grep -cE '^(CONFIG_|# CONFIG_.* is not set$)' build/r9s-docker.fragment)"
           make ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" O=out r9s_defconfig
-          ./scripts/kconfig/merge_config.sh -m out/.config build/r9s-docker.fragment
           make ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" O=out olddefconfig
+          echo "out/.config 中 =y/=m 计数: $(grep -cE '^CONFIG_.*=[ym]$' out/.config)"
           bash build/verify-config.sh out/.config
 
       - name: 编译 Image.gz-dtb 与模块
