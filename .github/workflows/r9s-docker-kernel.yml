@@ -1,0 +1,146 @@
+name: r9s-docker-kernel
+
+# 为 OPPO R9s/R9sk (msm8953, 3.18.31) 编译带容器支持的 boot 内核 + 配套 .ko
+# 产物在 artifact 里，本地用 repack_boot.py 拼成可刷的 boot.img。
+
+# 只手动触发：改代码后用 workflow_dispatch 重跑，避免 push 同时起第二个 90 分钟的构建
+on:
+  workflow_dispatch:
+    inputs:
+      verbose:
+        description: "在日志里多打印配置校验结果"
+        required: false
+        default: "0"
+
+jobs:
+  build:
+    # 固定 22.04：老 gcc 预编译包在新 glibc 上偶发缺 libmpfr.so.4，两处都做了兜底
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev \
+            device-tree-compiler xz-utils lz4 cpio rsync python3 libmpfr6 libgmp10
+
+      - name: 获取 aarch64 gcc 4.9 交叉工具链
+        # 内核 banner 显示 crDroid 用的就是 gcc 4.9，用同代编译器最稳（3.18 在 gcc10+ 上会因
+        # -fno-common 等一堆问题编不过）
+        run: |
+          set -e
+          mkdir -p /home/runner/tc && cd /home/runner/tc
+          URLS="
+          https://www.kernel.org/pub/tools/crosstool/files/bin/x86_64/4.9.4/gcc-4.9.4-nolibc-aarch64-linux.tar.xz
+          https://cdn.kernel.org/pub/tools/crosstool/files/bin/x86_64/4.9.4/gcc-4.9.4-nolibc-aarch64-linux.tar.xz
+          https://releases.linaro.org/components/toolchain/binaries/4.9-2016.06/aarch64-linux-gnu/gcc-linaro-4.9-2016.06-x86_64_aarch64-linux-gnu.tar.xz
+          https://releases.linaro.org/components/toolchain/binaries/4.9-2015.06/aarch64-linux-gnu/gcc-linaro-4.9-2015.06-x86_64_aarch64-linux-gnu.tar.xz
+          "
+          ok=0
+          for u in $URLS; do
+            echo "trying $u"
+            if curl -fL --retry 2 --max-time 900 -o tc.tar.xz "$u"; then ok=1; echo "GOT $u"; break; fi
+          done
+          [ "$ok" = 1 ] || { echo "no toolchain source worked"; exit 1; }
+          tar -xf tc.tar.xz
+          rm -f tc.tar.xz
+          GCC=$(find /home/runner/tc -maxdepth 3 -name '*-gcc' -type f | head -1)
+          echo "gcc driver: $GCC"
+          BINDIR=$(dirname "$GCC")
+          echo "CROSS_COMPILE=$(basename "$GCC" | sed 's/-gcc$//')-" >> "$GITHUB_ENV"
+          echo "TC_BINDIR=$BINDIR" >> "$GITHUB_ENV"
+          # 新版 libmpfr/libgmp 的名字兜底
+          for lib in libmpfr.so.4 libgmp.so.10; do
+            have=$(ldd "$GCC" 2>/dev/null | grep -c "$lib.*not found" || true)
+            if [ "$have" != "0" ]; then
+              case "$lib" in
+                libmpfr*) real=/usr/lib/x86_64-linux-gnu/libmpfr.so.6 ;;
+                libgmp*)  real=/usr/lib/x86_64-linux-gnu/libgmp.so.10 ;;
+              esac
+              mkdir -p /home/runner/tc/compat
+              ln -sf "$real" "/home/runner/tc/compat/$lib"
+              export LD_LIBRARY_PATH=/home/runner/tc/compat:${LD_LIBRARY_PATH:-}
+              echo "LD_LIBRARY_PATH=/home/runner/tc/compat" >> "$GITHUB_ENV"
+              echo "linked $lib -> $real"
+            fi
+          done
+          "$GCC" --version | head -1
+
+      - name: 应用容器补丁
+        run: |
+          python3 build/patch_qtaguid.py
+          git config user.email ci@example.invalid
+          git config user.name "ci"
+          # 提交让树变 clean，KERNELRELEASE 后缀可复现
+          git add -A && git commit -q -m "r9s: containers (qtaguid stub, config fragment, ci)" || true
+          git status --short | head
+
+      - name: 配置
+        run: |
+          set -e
+          make ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" O=out r9s_defconfig
+          ./scripts/kconfig/merge_config.sh -m out/.config build/r9s-docker.fragment
+          make ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" O=out olddefconfig
+          bash build/verify-config.sh out/.config
+
+      - name: 编译 Image.gz-dtb 与模块
+        # 分两次 make：boot/Makefile 用 $(shell find ... -name '*.dtb') 决定要拼哪些 dtb，
+        # 第一次 make 时 dtb 还没生成会是空列表，所以先出 dtbs/modules，再出 Image.gz-dtb。
+        # 本地重打包默认用 base boot.img 里原有的 4 个 DTB，这里只是顺带产出可比对的副本。
+        run: |
+          set -eo pipefail
+          M="make ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE O=out KCFLAGS=-w"
+          $M -j"$(nproc)" dtbs modules > build.log 2>&1 \
+            || { echo "=== BUILD FAILED ==="; tail -100 build.log; exit 1; }
+          $M Image.gz >> build.log 2>&1 || { tail -60 build.log; exit 1; }
+          $M Image.gz-dtb >> build.log 2>&1 || echo "Image.gz-dtb target unavailable (will append DTBs locally)"
+          tail -20 build.log
+          ls -l out/arch/arm64/boot/
+          echo "dtb count: $(find out/arch/arm64/boot/dts -name '*.dtb' | wc -l)"
+
+      - name: 汇总产物
+        run: |
+          set -e
+          D=artifacts; rm -rf $D; mkdir -p $D/modules $D/dtb
+          cp out/arch/arm64/boot/Image.gz-dtb $D/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image.gz $D/ 2>/dev/null || true
+          cp out/.config $D/config.txt
+          cp build.log $D/ 2>/dev/null || true
+          cp out/System.map $D/ 2>/dev/null || true
+          [ -f out/include/config/kernel.release ] && cp out/include/config/kernel.release $D/vermagic.txt
+          # 逐个 dtb 的大小，方便和 crDroid 现有的 241685/251702/243864/248550 对照
+          find out/arch/arm64/boot/dts -name '*.dtb' -printf '%s\t%P\n' | sort -n > $D/dtb/sizes.tsv || true
+          while IFS=$'\t' read -r sz path; do
+            cp "out/arch/arm64/boot/dts/$path" "$D/dtb/$(basename "$path")" || true
+          done < $D/dtb/sizes.tsv
+          find out -name '*.ko' -printf '%s\t%P\n' | sort -n > $D/modules/list.tsv
+          while IFS=$'\t' read -r sz path; do
+            cp "out/$path" "$D/modules/$(basename "$path")" || true
+          done < $D/modules/list.tsv
+          {
+            echo "== banner =="
+            python3 - "$D" <<'PY'
+          import gzip, re, sys, os
+          p = os.path.join(sys.argv[1], "Image.gz")
+          raw = gzip.open(p, "rb").read(1 << 20)
+          m = re.findall(rb"Linux version [0-9][^\x00\n]{0,120}", raw)
+          print(m[0].decode("latin1") if m else "banner not found")
+          PY
+            echo "== modules built =="; cat "$D/modules/list.tsv"
+            echo "== dtbs built =="; cat "$D/dtb/sizes.tsv"
+            echo "== vermagic =="; cat "$D/vermagic.txt" 2>/dev/null
+          } > $D/INFO.txt
+          cat $D/INFO.txt
+          du -sh $D
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r9s-docker-kernel-${{ github.run_number }}
+          path: artifacts
+          retention-days: 30
