@@ -71,6 +71,9 @@ jobs:
           BINDIR=$(dirname "$GCC")
           echo "CROSS_COMPILE=$(basename "$GCC" | sed 's/-gcc$//')-" >> "$GITHUB_ENV"
           echo "TC_BINDIR=$BINDIR" >> "$GITHUB_ENV"
+          # 内核 scripts/gcc-version.sh 是按命令名直接调 $(CROSS_COMPILE)gcc 的，
+          # 只给绝对路径没用，必须把工具链 bin 追加进后续步骤的 PATH
+          echo "$BINDIR" >> "$GITHUB_PATH"
           # 新版 libmpfr/libgmp 的名字兜底
           for lib in libmpfr.so.4 libgmp.so.10; do
             have=$(ldd "$GCC" 2>/dev/null | grep -c "$lib.*not found" || true)
